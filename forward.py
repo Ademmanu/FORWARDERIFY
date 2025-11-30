@@ -5,6 +5,7 @@ import logging
 import functools
 import gc
 import re
+import json
 from typing import Dict, List, Optional, Tuple, Set, Callable
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -85,7 +86,7 @@ target_entity_cache: Dict[int, Dict[int, object]] = {}  # user_id -> {target_id:
 # handler_registered maps user_id -> handler callable (so we can remove it)
 handler_registered: Dict[int, Callable] = {}
 
-# Per-task in-memory settings (not persisted). Default toggles ON, filters OFF.
+# Per-task persistent settings (now persisted in DB): in-memory mirror for fast access
 tasks_settings: Dict[int, Dict[str, Dict]] = {}  # user_id -> { label -> settings dict }
 
 # Global send queue is created later on the running event loop (in post_init/start_send_workers)
@@ -295,7 +296,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # task_delete_<label>
         # task_filters_toggle_<label>_<filter_key>
         # task_prefixsuffix_<label>  (to open prefix/suffix collector)
-        # task_confirm_delete_<label>_yes / _no
+        # task_confirm_<label>_yes / _no
         try:
             parts = data.split("_", 2)
             action = parts[1]
@@ -470,6 +471,13 @@ async def _toggle_task_setting(user_id: int, label: str, which: str, query, cont
         await query.answer("Control toggled")
     else:
         await query.answer()
+
+    # persist to DB (best-effort)
+    try:
+        await db_call(db.update_task_settings, user_id, label, settings)
+    except Exception:
+        logger.exception("Failed to persist task settings for %s/%s", user_id, label)
+
     # refresh task menu
     await _send_task_menu(user_id, label, query.message.chat.id, query.message.message_id, context)
 
@@ -481,6 +489,13 @@ async def _toggle_filter(user_id: int, label: str, filterkey: str, query, contex
         await query.answer("Filter toggled")
     else:
         await query.answer()
+
+    # persist change
+    try:
+        await db_call(db.update_task_settings, user_id, label, settings)
+    except Exception:
+        logger.exception("Failed to persist filter settings for %s/%s", user_id, label)
+
     await _send_filters_menu(user_id, label, query.message.chat.id, query.message.message_id, context)
 
 
@@ -694,6 +709,11 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             m = re.match(r"prefix\s*=\s*(.+)$", text, re.I)
             if m:
                 settings["prefix"] = m.group(1)
+                # persist to DB
+                try:
+                    await db_call(db.update_task_settings, user_id, label, settings)
+                except Exception:
+                    logger.exception("Failed to persist prefix for %s/%s", user_id, label)
                 await update.message.reply_text(f"✅ Prefix saved: `{settings['prefix']}`", parse_mode="Markdown")
             else:
                 await update.message.reply_text("❌ Invalid format. Use: `Prefix = <value>`", parse_mode="Markdown")
@@ -702,6 +722,10 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             m = re.match(r"suffix\s*=\s*(.+)$", text, re.I)
             if m:
                 settings["suffix"] = m.group(1)
+                try:
+                    await db_call(db.update_task_settings, user_id, label, settings)
+                except Exception:
+                    logger.exception("Failed to persist suffix for %s/%s", user_id, label)
                 await update.message.reply_text(f"✅ Suffix saved: `{settings['suffix']}`", parse_mode="Markdown")
             else:
                 await update.message.reply_text("❌ Invalid format. Use: `Suffix = <value>`", parse_mode="Markdown")
@@ -772,9 +796,10 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
             st["targets"] = [int(p) for p in parts]
 
-            # create task using existing DB function
+            # create task using existing DB function, with default persistent settings
+            default_settings = _make_default_task_settings()
             try:
-                added = await db_call(db.add_forwarding_task, user_id, st["name"], st["sources"], st["targets"])
+                added = await db_call(db.add_forwarding_task, user_id, st["name"], st["sources"], st["targets"], default_settings)
             except Exception as e:
                 logger.exception("Error adding forwarding task: %s", e)
                 await update.message.reply_text("❌ Failed to create task due to server error.", parse_mode="Markdown")
@@ -787,8 +812,8 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 tasks_cache[user_id].append(
                     {"id": None, "label": st["name"], "source_ids": st["sources"], "target_ids": st["targets"], "is_active": 1}
                 )
-                # initialize settings: toggles ON, filters OFF per request
-                tasks_settings.setdefault(user_id, {})[st["name"]] = _make_default_task_settings()
+                # initialize settings: toggles ON, filters OFF per request and persist already done
+                tasks_settings.setdefault(user_id, {})[st["name"]] = default_settings
 
                 # schedule async resolve of target entities (background)
                 try:
@@ -903,7 +928,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
 async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Start interactive flow:
-    1) Ask for task name (single word, example)
+    1) Ask for task name (single-word), example shown
     2) Ask for source IDs (comma-separated)
     3) Ask for target IDs (comma-separated)
     """
@@ -1291,12 +1316,8 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                             if send_queue is None:
                                 logger.debug("Send queue not initialized; dropping forward job")
                                 continue
-                            # If forward_tag allowed and no modification (raw_text only), prefer forward_messages
+                            # If forward_tag allowed and no modification (raw_text only), prefer forward original message object
                             if settings.get("forward_tag", True) and settings["filters"].get("raw_text") and len(out_messages) == 1:
-                                # queue a special marker (-1) to indicate forward original message object
-                                # We'll put the event.message in the queue as payload by converting message_text to a marker string
-                                # Instead we attach a tuple where target message payload is event.message (object). To keep type consistent, we push with target_id negative marker and let worker resolve.
-                                # Simpler: For forwarding we'll enqueue using a separate queue item that contains the message object directly.
                                 await send_queue.put((user_id, client, int(target_id), ("__FORWARD_ORIG__", getattr(event, "message", None))))
                             else:
                                 for om in out_messages:
@@ -1521,7 +1542,7 @@ async def restore_sessions():
         logger.exception("Error fetching logged-in users from DB")
         users = []
 
-    # Preload tasks cache from DB (single DB call off the loop)
+    # Preload tasks cache from DB (single DB call off the loop). Now includes persistent settings.
     try:
         all_active = await db_call(db.get_all_active_tasks)
     except Exception:
@@ -1534,8 +1555,12 @@ async def restore_sessions():
         uid = t["user_id"]
         tasks_cache.setdefault(uid, [])
         tasks_cache[uid].append({"id": t["id"], "label": t["label"], "source_ids": t["source_ids"], "target_ids": t["target_ids"], "is_active": 1})
-        # initialize default settings (toggles ON, filters OFF)
-        tasks_settings.setdefault(uid, {})[t["label"]] = _make_default_task_settings()
+        # initialize settings from DB (persisted)
+        try:
+            settings = t.get("settings") if isinstance(t.get("settings"), dict) else {}
+        except Exception:
+            settings = {}
+        tasks_settings.setdefault(uid, {})[t["label"]] = settings or _make_default_task_settings()
 
     logger.info("📊 Found %d logged in user(s)", len(users))
 
