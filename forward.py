@@ -1517,12 +1517,12 @@ def main():
     application.add_handler(CommandHandler("logout", logout_command))
     # start interactive forwadd
     application.add_handler(CommandHandler("forwadd", forwadd_command_start))
-    # keep legacy command names for convenience
+    # keep legacy command names for convenience - register the coroutine handlers directly
     application.add_handler(CommandHandler("fortasks", fortasks_command))
-    application.add_handler(CommandHandler("getallid", lambda u, c: asyncio.create_task(getallid_command(u, c))))
-    application.add_handler(CommandHandler("adduser", lambda u, c: asyncio.create_task(adduser_command(u, c))))
-    application.add_handler(CommandHandler("removeuser", lambda u, c: asyncio.create_task(removeuser_command(u, c))))
-    application.add_handler(CommandHandler("listusers", lambda u, c: asyncio.create_task(listusers_command(u, c))))
+    application.add_handler(CommandHandler("getallid", getallid_command))
+    application.add_handler(CommandHandler("adduser", adduser_command))
+    application.add_handler(CommandHandler("removeuser", removeuser_command))
+    application.add_handler(CommandHandler("listusers", listusers_command))
 
     # CallbackQuery handler for inline buttons
     application.add_handler(CallbackQueryHandler(button_handler))
@@ -1539,7 +1539,6 @@ def main():
             asyncio.run(shutdown_cleanup())
         except Exception:
             logger.exception("Error during shutdown cleanup")
-
 
 if __name__ == "__main__":
     main()
