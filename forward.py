@@ -984,7 +984,7 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
 
 # ---------- OPTIMIZED Forwarding core: handler registration, message handler, send worker, resolver ----------
 def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
-    """Attach a NewMessage handler once per client/user to avoid duplicates and store the handler (so we can remove it)."""
+    """Attach a NewMessage handler once per client/user to avoid duplicates and store the handler (so it can be removed)."""
     if handler_registered.get(user_id):
         return
 
@@ -1053,16 +1053,12 @@ def apply_filters_to_text(message_text: str, settings: Dict) -> List[str]:
     """
     # Default: only forward numeric-only messages (legacy behaviour), but if filters enabled, they override.
     text = message_text or ""
-    # If Forward Tag is handled elsewhere; here we only manipulate content.
-
     results: List[str] = []
-
-    # Helper to split into words and classify numeric vs alpha
     words = text.split()
-    has_alpha = any(any(ch.isalpha() for ch in w) for w in words)
-    has_digit = any(any(ch.isdigit() for ch in w) for w in words)
+    has_alpha = any(any(ch.isalpha() for ch in w) for w in words) if words else False
+    has_digit = any(any(ch.isdigit() for ch in w) for w in words) if words else False
 
-    # If Raw text filter on: forward entire text unmodified (with prefix/suffix)
+    # Raw text
     if settings.get("filter_raw"):
         out = text
         prefix = settings.get("filter_prefix") or ""
@@ -1070,26 +1066,23 @@ def apply_filters_to_text(message_text: str, settings: Dict) -> List[str]:
         results.append(f"{prefix}{out}{suffix}")
         return results
 
-    # Numbers only filter
+    # Numbers only
     if settings.get("filter_numbers"):
-        # Forward only if there's any digit in the message; otherwise ignore
         if any(ch.isdigit() for ch in text):
-            out = text
             prefix = settings.get("filter_prefix") or ""
             suffix = settings.get("filter_suffix") or ""
-            results.append(f"{prefix}{out}{suffix}")
+            results.append(f"{prefix}{text}{suffix}")
         return results
 
-    # Alphabets only filter
+    # Alphabets only
     if settings.get("filter_alpha"):
         if any(ch.isalpha() for ch in text):
-            out = text
             prefix = settings.get("filter_prefix") or ""
             suffix = settings.get("filter_suffix") or ""
-            results.append(f"{prefix}{out}{suffix}")
+            results.append(f"{prefix}{text}{suffix}")
         return results
 
-    # Removed Alphabetic: From mixed text (both letters and numbers), remove numeric words and forward only alphabetic words one by one.
+    # Removed Alphabetic: from mixed text, forward alphabetic words
     if settings.get("filter_remove_alpha"):
         if has_alpha and has_digit:
             for w in words:
@@ -1099,7 +1092,7 @@ def apply_filters_to_text(message_text: str, settings: Dict) -> List[str]:
                     results.append(f"{prefix}{w}{suffix}")
         return results
 
-    # Removed Numeric: From mixed text, remove alphabetic words and forward numeric words one by one.
+    # Removed Numeric: from mixed text, forward numeric words
     if settings.get("filter_remove_numeric"):
         if has_alpha and has_digit:
             for w in words:
@@ -1109,18 +1102,18 @@ def apply_filters_to_text(message_text: str, settings: Dict) -> List[str]:
                     results.append(f"{prefix}{w}{suffix}")
         return results
 
-    # If no filters are active, preserve legacy behavior: only forward messages that are purely numeric
-    if not any(settings.get(k) for k in [
+    # If no filters are active: legacy behavior - forward only numeric-only messages
+    active_filters = any(settings.get(k) for k in [
         "filter_raw", "filter_numbers", "filter_alpha", "filter_remove_alpha", "filter_remove_numeric"
-    ]):
+    ])
+    if not active_filters:
         if text.strip().isdigit():
             prefix = settings.get("filter_prefix") or ""
             suffix = settings.get("filter_suffix") or ""
             results.append(f"{prefix}{text.strip()}{suffix}")
-        # else: do not forward
         return results
 
-    # Fallback: if filters exist but didn't match, return empty
+    # Otherwise fallback to nothing
     return results
 
 
@@ -1480,6 +1473,27 @@ def task_get(user_id: int, label: str) -> Optional[Dict]:
     return next((t for t in user_tasks if t.get("label") == label), None)
 
 
+# ---------- Unified message handler (login, forwadd steps, task settings) ----------
+async def extended_unified_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Routes incoming plain text (non-command) messages to the appropriate interactive flow:
+    - if user is in forwadd multi-step, handle_forwadd_steps
+    - if user is in task settings interaction (prefix/suffix/delete confirm), task_settings_text_handler
+    - otherwise, treat as part of login process (handle_login_process)
+    """
+    user_id = update.effective_user.id
+    # Task settings text step has highest priority
+    if user_id in task_settings_state:
+        await task_settings_text_handler(update, context)
+        return
+    # forwadd interactive flow
+    if user_id in forwadd_states:
+        await handle_forwadd_steps(update, context)
+        return
+    # login flow fallback
+    await handle_login_process(update, context)
+
+
 # ---------- Main -----------
 def main():
     if not BOT_TOKEN:
@@ -1497,22 +1511,23 @@ def main():
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # Command handlers
+    # Register command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("login", login_command))
     application.add_handler(CommandHandler("logout", logout_command))
-    # /forwadd starts the interactive flow
+    # start interactive forwadd
     application.add_handler(CommandHandler("forwadd", forwadd_command_start))
+    # keep legacy command names for convenience
     application.add_handler(CommandHandler("fortasks", fortasks_command))
     application.add_handler(CommandHandler("getallid", lambda u, c: asyncio.create_task(getallid_command(u, c))))
     application.add_handler(CommandHandler("adduser", lambda u, c: asyncio.create_task(adduser_command(u, c))))
     application.add_handler(CommandHandler("removeuser", lambda u, c: asyncio.create_task(removeuser_command(u, c))))
     application.add_handler(CommandHandler("listusers", lambda u, c: asyncio.create_task(listusers_command(u, c))))
 
-    # Callback query handler for inline buttons
+    # CallbackQuery handler for inline buttons
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    # Unified text handler: login flow, forwadd steps, task settings steps
+    # Unified text handler: handles login steps, forwadd steps, and task settings flows
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, extended_unified_text_handler))
 
     logger.info("✅ Bot ready!")
