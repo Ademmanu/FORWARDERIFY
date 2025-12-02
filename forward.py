@@ -843,28 +843,25 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     task["filters"] = filters
     tasks_cache[user_id][task_index] = task
     
-    # Show immediate feedback
-    status_display = "✅ On" if new_state else "❌ Off"
-    await query.answer(f"{status_text}: {status_display}")
-    
-    # Get the current keyboard and update the specific button
+    # Update the button inline FIRST (before answering)
     keyboard = query.message.reply_markup.inline_keyboard
-    
-    # Find and update the button with matching callback data
     button_found = False
     new_emoji = "✅" if new_state else "❌"
     
+    # Create a new keyboard with updated button
+    new_keyboard = []
     for row in keyboard:
-        for i, button in enumerate(row):
+        new_row = []
+        for button in row:
             if button.callback_data == query.data:
-                # Update just this button
+                # Update this button
                 current_text = button.text
                 # Extract the text after the emoji
-                if current_text.startswith("✅ "):
-                    text_without_emoji = current_text[2:]
+                if "✅ " in current_text:
+                    text_without_emoji = current_text.split("✅ ", 1)[1]
                     new_text = f"{new_emoji} {text_without_emoji}"
-                elif current_text.startswith("❌ "):
-                    text_without_emoji = current_text[2:]
+                elif "❌ " in current_text:
+                    text_without_emoji = current_text.split("❌ ", 1)[1]
                     new_text = f"{new_emoji} {text_without_emoji}"
                 elif current_text.startswith("✅"):
                     text_without_emoji = current_text[1:]
@@ -873,30 +870,40 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
                     text_without_emoji = current_text[1:]
                     new_text = f"{new_emoji}{text_without_emoji}"
                 else:
-                    # Fallback
-                    new_text = f"{new_emoji} {toggle_type.replace('_', ' ').title()}"
+                    # Fallback - preserve the button text but change emoji
+                    new_text = f"{new_emoji} {current_text}"
                 
-                row[i] = InlineKeyboardButton(new_text, callback_data=query.data)
+                new_row.append(InlineKeyboardButton(new_text, callback_data=query.data))
                 button_found = True
-                break
-        if button_found:
-            break
+            else:
+                new_row.append(button)
+        new_keyboard.append(new_row)
     
-    # Update the keyboard inline
+    # Update the message inline if button was found
     if button_found:
         try:
+            # Update the button first
             await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                reply_markup=InlineKeyboardMarkup(new_keyboard)
             )
+            # Then show the notification
+            status_display = "✅ On" if new_state else "❌ Off"
+            await query.answer(f"{status_text}: {status_display}")
         except Exception as e:
             logger.exception("Error updating inline keyboard: %s", e)
-            # Fall back to refreshing the entire menu if inline update fails
+            # If update fails, at least show the notification
+            status_display = "✅ On" if new_state else "❌ Off"
+            await query.answer(f"{status_text}: {status_display}")
+            # Fall back to refreshing the entire menu
             if toggle_type in ["outgoing", "forward_tag", "control"]:
                 await handle_task_menu(update, context)
             else:
                 await handle_filter_menu(update, context)
     else:
-        # If button not found, refresh the entire menu
+        # If button not found, at least show notification
+        status_display = "✅ On" if new_state else "❌ Off"
+        await query.answer(f"{status_text}: {status_display}")
+        # Refresh the entire menu
         if toggle_type in ["outgoing", "forward_tag", "control"]:
             await handle_task_menu(update, context)
         else:
