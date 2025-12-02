@@ -1033,15 +1033,56 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
-    await client.connect()
+    # Check if user is already logged in
+    user = await db_call(db.get_user, user_id)
+    if user and user.get("is_logged_in"):
+        await message.reply_text(
+            "✅ **You are already logged in!**\n\n"
+            f"📱 Phone: `{user['phone']}`\n"
+            f"👤 Name: `{user['name']}`\n\n"
+            "Use /logout if you want to disconnect.",
+            parse_mode="Markdown",
+        )
+        return
+
+    client = TelegramClient(
+        StringSession(), 
+        API_ID, 
+        API_HASH,
+        device_model="ForwardBot",
+        system_version="1.0",
+        app_version="1.0",
+        lang_code="en"
+    )
+    
+    try:
+        await client.connect()
+    except Exception as e:
+        await message.reply_text(
+            f"❌ **Connection failed:** {str(e)}\n\n"
+            "Please try again in a few minutes.",
+            parse_mode="Markdown",
+        )
+        return
 
     login_states[user_id] = {"client": client, "step": "waiting_phone"}
 
     await message.reply_text(
-        "📱 **Enter your phone number** (with country code):\n\n"
-        "Example: `+1234567890`\n\n"
-        "⚠️ Make sure to include the + sign!",
+        "📱 **Login Process**\n\n"
+        "1️⃣ **Enter your phone number** (with country code):\n\n"
+        "**Examples:**\n"
+        "• `+1234567890`\n"
+        "• `+447911123456`\n"
+        "• `+4915112345678`\n\n"
+        "⚠️ **Important:**\n"
+        "• Include the `+` sign\n"
+        "• Use international format\n"
+        "• No spaces or dashes\n\n"
+        "If you don't receive a code, try:\n"
+        "1. Check phone number format\n"
+        "2. Wait 2 minutes between attempts\n"
+        "3. Use the Telegram app to verify\n\n"
+        "**Type your phone number now:**",
         parse_mode="Markdown",
     )
 
@@ -1049,6 +1090,16 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
+    # First check if we're in task creation
+    if user_id in task_creation_states:
+        await handle_task_creation(update, context)
+        return
+    
+    # Check if we're waiting for prefix/suffix input
+    if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
+        await handle_prefix_suffix_input(update, context)
+        return
+    
     if user_id in logout_states:
         handled = await handle_logout_confirmation(update, context)
         if handled:
@@ -1063,51 +1114,124 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         if state["step"] == "waiting_phone":
+            # Validate phone number format
+            if not text.startswith('+'):
+                await update.message.reply_text(
+                    "❌ **Invalid format!**\n\n"
+                    "Phone number must start with `+`\n"
+                    "Example: `+1234567890`\n\n"
+                    "Please enter your phone number again:",
+                    parse_mode="Markdown",
+                )
+                return
+            
+            # Clean phone number (remove spaces, dashes, parentheses)
+            clean_phone = ''.join(c for c in text if c.isdigit() or c == '+')
+            
+            if len(clean_phone) < 8:
+                await update.message.reply_text(
+                    "❌ **Invalid phone number!**\n\n"
+                    "Phone number seems too short. Please check and try again.\n"
+                    "Example: `+1234567890`",
+                    parse_mode="Markdown",
+                )
+                return
+
             processing_msg = await update.message.reply_text(
-                "⏳ **Processing...**\n\n"
-                "Requesting verification code from Telegram...",
+                "⏳ **Sending verification code...**\n\n"
+                "This may take a few seconds. Please wait...",
                 parse_mode="Markdown",
             )
 
-            result = await client.send_code_request(text)
-            state["phone"] = text
-            state["phone_code_hash"] = result.phone_code_hash
-            state["step"] = "waiting_code"
+            try:
+                # Try to send code request with better error handling
+                result = await client.send_code_request(clean_phone)
+                state["phone"] = clean_phone
+                state["phone_code_hash"] = result.phone_code_hash
+                state["step"] = "waiting_code"
 
-            await processing_msg.edit_text(
-                "✅ **Code sent!**\n\n"
-                "🔑 **Enter the verification code in this format:**\n\n"
-                "`verify12345`\n\n"
-                "⚠️ Type 'verify' followed immediately by your code (no spaces, no brackets).\n"
-                "Example: If your code is 54321, type: `verify54321`",
-                parse_mode="Markdown",
-            )
+                await processing_msg.edit_text(
+                    "✅ **Verification code sent!**\n\n"
+                    "📱 **Code sent to:** `{}`\n\n"
+                    "2️⃣ **Enter the verification code:**\n\n"
+                    "**Format:** `verify12345`\n"
+                    "• Type `verify` followed by your 5-digit code\n"
+                    "• No spaces, no brackets\n\n"
+                    "**Example:** If your code is `54321`, type:\n"
+                    "`verify54321`\n\n"
+                    "⚠️ **If you don't receive the code:**\n"
+                    "1. Check your Telegram app notifications\n"
+                    "2. Wait 2-3 minutes\n"
+                    "3. Check spam messages\n"
+                    "4. Try login via Telegram app first".format(clean_phone),
+                    parse_mode="Markdown",
+                )
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.exception("Error sending code for user %s: %s", user_id, error_msg)
+                
+                # Handle specific error cases
+                if "PHONE_NUMBER_INVALID" in error_msg:
+                    error_text = "❌ **Invalid phone number!**\n\nPlease check the format and try again."
+                elif "PHONE_NUMBER_BANNED" in error_msg:
+                    error_text = "❌ **Phone number banned!**\n\nThis phone number cannot be used."
+                elif "FLOOD" in error_msg or "Too many" in error_msg:
+                    error_text = "❌ **Too many attempts!**\n\nPlease wait 2-3 minutes before trying again."
+                elif "PHONE_CODE_EXPIRED" in error_msg:
+                    error_text = "❌ **Code expired!**\n\nPlease start over with /login."
+                else:
+                    error_text = f"❌ **Error:** {error_msg}\n\nPlease try again in a few minutes."
+                
+                await processing_msg.edit_text(
+                    error_text + "\n\nUse /login to try again.",
+                    parse_mode="Markdown",
+                )
+                
+                # Clean up on error
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                
+                if user_id in login_states:
+                    del login_states[user_id]
+                return
 
         elif state["step"] == "waiting_code":
             if not text.startswith("verify"):
                 await update.message.reply_text(
                     "❌ **Invalid format!**\n\n"
-                    "Please use this format:\n"
-                    "`verify12345`\n\n"
-                    "Type 'verify' followed immediately by your code.\n"
-                    "Example: If your code is 54321, type: `verify54321`",
+                    "Please use the format: `verify12345`\n\n"
+                    "Type `verify` followed immediately by your 5-digit code.\n"
+                    "**Example:** `verify54321`",
                     parse_mode="Markdown",
                 )
                 return
 
-            code = text[6:]
-
+            code = text[6:]  # Remove "verify" prefix
+            
+            # Validate code format
             if not code or not code.isdigit():
                 await update.message.reply_text(
                     "❌ **Invalid code!**\n\n"
-                    "Please type 'verify' followed by your verification code.\n"
-                    "Example: `verify12345`",
+                    "Code must contain only digits.\n"
+                    "**Example:** `verify12345`",
+                    parse_mode="Markdown",
+                )
+                return
+            
+            if len(code) != 5:
+                await update.message.reply_text(
+                    "❌ **Code must be 5 digits!**\n\n"
+                    f"Your code has {len(code)} digits. Please check and try again.\n"
+                    "**Example:** `verify12345`",
                     parse_mode="Markdown",
                 )
                 return
 
             verifying_msg = await update.message.reply_text(
-                "🔄 **Verifying...**\n\n" "Checking your verification code...",
+                "🔄 **Verifying code...**\n\nPlease wait...",
                 parse_mode="Markdown",
             )
 
@@ -1128,22 +1252,44 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 del login_states[user_id]
 
                 await verifying_msg.edit_text(
-                    "✅ **Successfully connected!**\n\n"
-                    f"👤 Name: {me.first_name}\n"
-                    f"📱 Phone: {state['phone']}\n\n"
-                    "You can now create forwarding tasks with:\n"
-                    "/forwadd",
+                    "✅ **Successfully connected!** 🎉\n\n"
+                    f"👤 **Name:** {me.first_name or 'User'}\n"
+                    f"📱 **Phone:** `{state['phone']}`\n"
+                    f"🆔 **User ID:** `{me.id}`\n\n"
+                    "**Now you can:**\n"
+                    "• Create forwarding tasks with /forwadd\n"
+                    "• View your tasks with /fortasks\n"
+                    "• Get chat IDs with /getallid\n\n"
+                    "Welcome aboard! 🚀",
                     parse_mode="Markdown",
                 )
 
             except SessionPasswordNeededError:
                 state["step"] = "waiting_2fa"
                 await verifying_msg.edit_text(
-                    "🔐 **2FA Password Required**\n\n"
-                    "**Enter your 2-step verification password in this format:**\n\n"
-                    "`passwordYourPassword123`\n\n"
-                    "⚠️ Type 'password' followed immediately by your 2FA password (no spaces, no brackets).\n"
-                    "Example: If your password is 'mypass123', type: `passwordmypass123`",
+                    "🔐 **2-Step Verification Required**\n\n"
+                    "This account has 2FA enabled for extra security.\n\n"
+                    "3️⃣ **Enter your 2FA password:**\n\n"
+                    "**Format:** `passwordYourPassword123`\n"
+                    "• Type `password` followed by your 2FA password\n"
+                    "• No spaces, no brackets\n\n"
+                    "**Example:** If your password is `mypass123`, type:\n"
+                    "`passwordmypass123`",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                error_msg = str(e)
+                logger.exception("Error verifying code for user %s: %s", user_id, error_msg)
+                
+                if "PHONE_CODE_INVALID" in error_msg:
+                    error_text = "❌ **Invalid code!**\n\nPlease check the code and try again."
+                elif "PHONE_CODE_EXPIRED" in error_msg:
+                    error_text = "❌ **Code expired!**\n\nPlease request a new code with /login."
+                else:
+                    error_text = f"❌ **Verification failed:** {error_msg}"
+                
+                await verifying_msg.edit_text(
+                    error_text + "\n\nUse /login to try again.",
                     parse_mode="Markdown",
                 )
 
@@ -1151,55 +1297,77 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             if not text.startswith("password"):
                 await update.message.reply_text(
                     "❌ **Invalid format!**\n\n"
-                    "Please use this format:\n"
-                    "`passwordYourPassword123`\n\n"
-                    "Type 'password' followed immediately by your 2FA password.\n"
-                    "Example: If your password is 'mypass123', type: `passwordmypass123`",
+                    "Please use the format: `passwordYourPassword123`\n\n"
+                    "Type `password` followed immediately by your 2FA password.\n"
+                    "**Example:** `passwordmypass123`",
                     parse_mode="Markdown",
                 )
                 return
 
-            password = text[8:]
+            password = text[8:]  # Remove "password" prefix
 
             if not password:
                 await update.message.reply_text(
                     "❌ **No password provided!**\n\n"
-                    "Please type 'password' followed by your 2FA password.\n"
-                    "Example: `passwordmypass123`",
+                    "Please type `password` followed by your 2FA password.\n"
+                    "**Example:** `passwordmypass123`",
                     parse_mode="Markdown",
                 )
                 return
 
             verifying_msg = await update.message.reply_text(
-                "🔄 **Verifying 2FA...**\n\n" "Checking your password...", parse_mode="Markdown"
-            )
-
-            await client.sign_in(password=password)
-
-            me = await client.get_me()
-            session_string = client.session.save()
-
-            await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
-
-            user_clients[user_id] = client
-            tasks_cache.setdefault(user_id, [])
-            target_entity_cache.setdefault(user_id, {})
-            await start_forwarding_for_user(user_id)
-
-            del login_states[user_id]
-
-            await verifying_msg.edit_text(
-                "✅ **Successfully connected!**\n\n"
-                f"👤 Name: {me.first_name}\n"
-                f"📱 Phone: {state['phone']}\n\n"
-                "You can now create forwarding tasks!",
+                "🔄 **Verifying 2FA password...**\n\nPlease wait...",
                 parse_mode="Markdown",
             )
 
+            try:
+                await client.sign_in(password=password)
+
+                me = await client.get_me()
+                session_string = client.session.save()
+
+                await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
+
+                user_clients[user_id] = client
+                tasks_cache.setdefault(user_id, [])
+                target_entity_cache.setdefault(user_id, {})
+                await start_forwarding_for_user(user_id)
+
+                del login_states[user_id]
+
+                await verifying_msg.edit_text(
+                    "✅ **Successfully connected with 2FA!** 🎉\n\n"
+                    f"👤 **Name:** {me.first_name or 'User'}\n"
+                    f"📱 **Phone:** `{state['phone']}`\n"
+                    f"🆔 **User ID:** `{me.id}`\n\n"
+                    "**Now you can:**\n"
+                    "• Create forwarding tasks with /forwadd\n"
+                    "• View your tasks with /fortasks\n"
+                    "• Get chat IDs with /getallid\n\n"
+                    "Your account is now securely connected! 🔐",
+                    parse_mode="Markdown",
+                )
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.exception("Error verifying 2FA for user %s: %s", user_id, error_msg)
+                
+                if "PASSWORD_HASH_INVALID" in error_msg or "PASSWORD_INVALID" in error_msg:
+                    error_text = "❌ **Invalid 2FA password!**\n\nPlease check your password and try again."
+                else:
+                    error_text = f"❌ **2FA verification failed:** {error_msg}"
+                
+                await verifying_msg.edit_text(
+                    error_text + "\n\nUse /login to try again.",
+                    parse_mode="Markdown",
+                )
+
     except Exception as e:
-        logger.exception("Error during login process for %s", user_id)
+        logger.exception("Unexpected error during login process for %s", user_id)
         await update.message.reply_text(
-            f"❌ **Error:** {str(e)}\n\n" "Please try /login again.",
+            f"❌ **Unexpected error:** {str(e)}\n\n"
+            "Please try /login again.\n\n"
+            "If the problem persists, contact support.",
             parse_mode="Markdown",
         )
         if user_id in login_states:
@@ -1211,7 +1379,6 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception:
                 logger.exception("Error disconnecting client after failed login for %s", user_id)
             del login_states[user_id]
-
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
