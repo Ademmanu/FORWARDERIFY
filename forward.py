@@ -80,7 +80,7 @@ target_entity_cache: Dict[int, Dict[int, object]] = {}  # user_id -> {target_id:
 handler_registered: Dict[int, Callable] = {}
 
 # Global send queue is created later on the running event loop (in post_init/start_send_workers)
-send_queue: Optional[asyncio.Queue[Tuple[int, TelegramClient, int, str, Dict, bool, Optional[int]]]] = None
+send_queue: Optional[asyncio.Queue[Tuple[int, TelegramClient, int, str, Dict, bool, Optional[int], Optional[int]]]] = None
 
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
@@ -1628,11 +1628,11 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                                     logger.debug("Send queue not initialized; dropping forward job")
                                     continue
                                     
-                                # Include message ID if forward tag is enabled
-                                message_id = message.id if forward_tag else None
-                                    
+                                # Pass source chat ID and message ID for forwarding
                                 await send_queue.put((user_id, client, int(target_id), filtered_msg, 
-                                                     task.get("filters", {}), forward_tag, message_id))
+                                                     task.get("filters", {}), forward_tag, 
+                                                     chat_id if forward_tag else None,  # Add source chat ID
+                                                     message.id if forward_tag else None))
                             except asyncio.QueueFull:
                                 logger.warning("Send queue full, dropping forward job for user=%s target=%s", user_id, target_id)
         except Exception:
@@ -1687,7 +1687,8 @@ async def send_worker_loop(worker_id: int):
 
     while True:
         try:
-            user_id, client, target_id, message_text, task_filters, forward_tag, message_id = await send_queue.get()
+            # Updated to include source_chat_id
+            user_id, client, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id = await send_queue.get()
         except asyncio.CancelledError:
             # Worker cancelled during shutdown
             break
@@ -1707,13 +1708,17 @@ async def send_worker_loop(worker_id: int):
                 continue
 
             try:
-                if forward_tag and message_id:
+                if forward_tag and source_chat_id and message_id:
                     # Forward the original message with tag
-                    # Get source entity from the original chat (we need to find which source chat this came from)
-                    # Since we don't store source chat ID in queue, we'll just send as regular message with forward style
-                    # This is a limitation - we need source chat ID to forward properly
-                    await client.send_message(entity, message_text)
-                    logger.debug("Forwarded message with tag for user %s to %s", user_id, target_id)
+                    try:
+                        source_entity = await client.get_input_entity(int(source_chat_id))
+                        # Forward the original message
+                        await client.forward_messages(entity, message_id, source_entity)
+                        logger.debug("Forwarded message with tag for user %s to %s", user_id, target_id)
+                    except Exception as e:
+                        logger.warning("Failed to forward with tag, falling back to regular send: %s", e)
+                        # Fallback to regular message if forwarding fails
+                        await client.send_message(entity, message_text)
                 else:
                     # Send as regular message without tag
                     await client.send_message(entity, message_text)
@@ -1724,7 +1729,8 @@ async def send_worker_loop(worker_id: int):
                 logger.warning("FloodWait for %s seconds. Pausing worker %d", wait, worker_id)
                 await asyncio.sleep(wait + 1)
                 try:
-                    await send_queue.put((user_id, client, target_id, message_text, task_filters, forward_tag, message_id))
+                    # Update queue put with correct number of arguments
+                    await send_queue.put((user_id, client, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id))
                 except asyncio.QueueFull:
                     logger.warning("Send queue full while re-enqueueing after FloodWait; dropping message.")
             except Exception as e:
