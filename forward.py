@@ -1144,23 +1144,43 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
             try:
-                # Try to send code request with better error handling
-                result = await client.send_code_request(clean_phone)
+                # Try to send code request with force_sms if available, else fallback.
+                try:
+                    result = await client.send_code_request(clean_phone, force_sms=True)
+                    logger.info("send_code_request(force_sms=True) returned for %s: %r", clean_phone, result)
+                except TypeError:
+                    # Telethon version may not accept force_sms kwarg
+                    result = await client.send_code_request(clean_phone)
+                    logger.info("send_code_request (no force_sms kw) returned for %s: %r", clean_phone, result)
+                except Exception as e:
+                    # If force_sms raised, attempt fallback without force_sms
+                    logger.warning("send_code_request(force_sms=True) raised for %s: %s. Trying without force_sms.", clean_phone, e)
+                    try:
+                        result = await client.send_code_request(clean_phone)
+                        logger.info("send_code_request (fallback without force_sms) returned for %s: %r", clean_phone, result)
+                    except Exception as e2:
+                        logger.exception("Error sending code for user %s: %s", user_id, e2)
+                        raise e2
+
                 state["phone"] = clean_phone
-                state["phone_code_hash"] = result.phone_code_hash
+                # phone_code_hash may be on the returned object in different attributes; try to extract safely
+                phone_code_hash = getattr(result, "phone_code_hash", None) or getattr(result, "phone_code_hash", None)
+                state["phone_code_hash"] = phone_code_hash
                 state["step"] = "waiting_code"
+
+                logger.info("Code request successful for user %s phone=%s phone_code_hash=%s", user_id, clean_phone, phone_code_hash)
 
                 await processing_msg.edit_text(
                     "✅ **Verification code sent!**\n\n"
                     "📱 **Code sent to:** `{}`\n\n"
                     "2️⃣ **Enter the verification code:**\n\n"
                     "**Format:** `verify12345`\n"
-                    "• Type `verify` followed by your 5-digit code\n"
+                    "• Type `verify` followed by your code (digits only)\n"
                     "• No spaces, no brackets\n\n"
                     "**Example:** If your code is `54321`, type:\n"
                     "`verify54321`\n\n"
                     "⚠️ **If you don't receive the code:**\n"
-                    "1. Check your Telegram app notifications\n"
+                    "1. Check your Telegram app notifications (code might arrive there)\n"
                     "2. Wait 2-3 minutes\n"
                     "3. Check spam messages\n"
                     "4. Try login via Telegram app first".format(clean_phone),
@@ -1203,7 +1223,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text(
                     "❌ **Invalid format!**\n\n"
                     "Please use the format: `verify12345`\n\n"
-                    "Type `verify` followed immediately by your 5-digit code.\n"
+                    "Type `verify` followed immediately by your code (digits only).\n"
                     "**Example:** `verify54321`",
                     parse_mode="Markdown",
                 )
@@ -1211,20 +1231,11 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
             code = text[6:]  # Remove "verify" prefix
             
-            # Validate code format
+            # Validate code format - accept variable length numeric codes (no rigid 5-digit requirement)
             if not code or not code.isdigit():
                 await update.message.reply_text(
                     "❌ **Invalid code!**\n\n"
                     "Code must contain only digits.\n"
-                    "**Example:** `verify12345`",
-                    parse_mode="Markdown",
-                )
-                return
-            
-            if len(code) != 5:
-                await update.message.reply_text(
-                    "❌ **Code must be 5 digits!**\n\n"
-                    f"Your code has {len(code)} digits. Please check and try again.\n"
                     "**Example:** `verify12345`",
                     parse_mode="Markdown",
                 )
@@ -1236,7 +1247,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
             try:
-                await client.sign_in(state["phone"], code, phone_code_hash=state["phone_code_hash"])
+                await client.sign_in(state["phone"], code, phone_code_hash=state.get("phone_code_hash"))
 
                 me = await client.get_me()
                 session_string = client.session.save()
